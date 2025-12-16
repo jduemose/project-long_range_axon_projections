@@ -13,8 +13,8 @@ import simnibs
 from simnibs.mesh_tools import cython_msh, mesh_io
 from simnibs.utils.mesh_element_properties import ElementTypes
 
-from .polynomial import StackedVectorPolynomial
-
+from polynomial import StackedVectorPolynomial
+import io_utils
 
 """
 
@@ -62,6 +62,7 @@ def prepare_field(mesh, boundary_indices: dict, boundary_values: dict, cond=None
     """
     assert np.all(mesh.elm.elm_type == ElementTypes.TETRAHEDRON)
 
+    # Define boundary conditions
     v_idx = np.concatenate([boundary_indices[k] for k in boundary_indices]) + 1
     v_val = np.concatenate(
         [
@@ -69,17 +70,7 @@ def prepare_field(mesh, boundary_indices: dict, boundary_values: dict, cond=None
             for k in boundary_indices
         ]
     )
-
-    # Define boundary conditions
     dirichlet = simnibs.simulation.fem.DirichletBC(v_idx, v_val)
-    #     np.concatenate((boundary_indices["inner"], boundary_indices["outer"])) + 1,
-    #     np.concatenate(
-    #         (
-    #             np.full(boundary_indices["inner"].size, boundary_values["inner"]),
-    #             np.full(boundary_indices["outer"].size, boundary_values["outer"]),
-    #         )
-    #     ),
-    # )
 
     print("Setting up system")
     if cond is None:
@@ -90,7 +81,6 @@ def prepare_field(mesh, boundary_indices: dict, boundary_values: dict, cond=None
         print("Setting all conductivities to 1.0!")
     else:
         print("Using provided conductivities")
-        # cond = mesh.field["cond_smoothed"]
 
     laplace_eq = simnibs.simulation.fem.FEMSystem(mesh, cond, dirichlet, store_G=True)
     print("Solving equation")
@@ -110,7 +100,7 @@ def prepare_field(mesh, boundary_indices: dict, boundary_values: dict, cond=None
     E_mag = np.linalg.norm(E, axis=1)
     is_valid = E_mag.squeeze() > 1e-8
 
-    print("E magnitude (minimum)", E_mag.min())
+    print(f"Minimum E field magnitude : {E_mag.min()}")
     mesh.nodedata += [
         mesh_io.NodeData(potential, "V", mesh),
         mesh_io.NodeData(E, "E", mesh),
@@ -122,6 +112,7 @@ def prepare_field(mesh, boundary_indices: dict, boundary_values: dict, cond=None
 
 
 def prepare_for_tetrahedron_with_points(mesh):
+    """Precalculate some things."""
     indices_tetra = mesh.elm.tetrahedra
     nodes_tetra = np.array(mesh.nodes[mesh.elm[indices_tetra]], float)
     th_baricenters = nodes_tetra.mean(1)
@@ -145,7 +136,6 @@ def tetrahedron_with_points(
 
     # calculate baricentric coordinates
     inside = tetra_index != -1
-
     M = np.transpose(
         nodes_tetra[tetra_index[inside], :3]
         - nodes_tetra[tetra_index[inside], 3, None],
@@ -190,8 +180,6 @@ def integrate_field(
         _description_
     """
 
-    # is_valid = mesh.field["valid"].value
-
     # collect necessary quantities
 
     # Vertices
@@ -201,7 +189,7 @@ def integrate_field(
     N = np.divide(E, E_mag[:, None], where=E_mag[:, None] > 0)  # normalize E
 
     # Elements
-    # For linear interpolation within elements)
+    # (for linear interpolation within elements)
     faces = mesh.elm.node_number_list - 1
     V_elm = V[faces]
     N_elm = N[faces]
@@ -216,21 +204,8 @@ def integrate_field(
     )
     t1 = time.perf_counter()
     print(f"{'Initializing':40s} {t1 - t0:5.2f} s")
-
-    # valid_seed_points = is_valid[seed_points]
-    # valid_gm = seed_points[valid_seed_points]
-    # thickness = np.zeros(valid_gm.size)
-
-    # START
-    # -----
-
-    # y = V[valid_gm]
-    # pos = mesh.nodes.node_coord[valid_gm]
-
-    # Initialize
     # Starting position for walking algorithm: the closest baricenter
     _, tetra_index = np.array(kdtree.query(seed_points), int)
-
     tetra_index, coo_bari = tetrahedron_with_points(
         seed_points,
         faces_tetra,
@@ -252,9 +227,6 @@ def integrate_field(
     thickness = np.zeros(n_valid)
     is_in_domain = np.ones(n_valid, dtype=bool)
     is_in_domain_masked = np.ones(n_valid, dtype=bool)
-
-    # is_in_domain = np.ones(valid_gm.size, dtype=bool)
-    # is_in_domain_masked = np.ones(valid_gm.size, dtype=bool)
 
     traces = [pos.copy()]
     field_value = [y.copy()]
@@ -319,7 +291,6 @@ def integrate_field(
             V_elm[tetra_index[is_in_domain_masked]] * coo_bari[is_in_domain_masked], 1
         )
 
-        # REMOVE; only for diagnostics...
         if verbose:
             print(
                 (
@@ -340,8 +311,9 @@ def integrate_field(
     print("Terminating after iteration", i)
     print(f"Reason: {reason}")
 
-    traces = np.array(traces)
-    field_value = np.array(field_value)
+    # [iterations,lines,coord] -> [lines, iterations,coord]
+    traces = np.ascontiguousarray(np.transpose(np.array(traces), (1, 0, 2)))
+    field_value = np.ascontiguousarray(np.array(field_value).T)
 
     print(f"{'Trace field lines':40s} {time.perf_counter() - t1:5.2f} s")
 
@@ -457,7 +429,7 @@ def generate_conductivity_map(mesh, wm, wm_dist_cutoff=0.0, value=0.25):
     # distance[wm_vertices - 1] = dist
 
     cond = np.ones(mesh.nodes.nr)
-    close = distance <= wm_dist_cutoff
+    close = distance >= wm_dist_cutoff
     cond[close] = value
     # Map to elements
     cond = cond[mesh.elm.node_number_list - 1].mean(1)
@@ -495,22 +467,24 @@ def generate_conductivity_map(mesh, wm, wm_dist_cutoff=0.0, value=0.25):
     # m.elmdata.append(mesh_io.ElementData(FA, "FA"))
 
 
-def compute_curvatures_and_radii(sampled_p, n_iter, number_of_points=3):
+def compute_curvatures_and_radii(
+    points, n_iter, number_of_points=3, exclude_initial=0, exclude_final=0
+):
     assert number_of_points % 2 == 1
     c = number_of_points // 2
-    insert_start_offset = c
-    insert_end_offset = c - 1
+    insert_start_offset = exclude_initial + c
+    insert_end_offset = exclude_final + c
 
-    sampled_p_t = sampled_p.transpose(1, 0, 2)
-    # view = np.transpose(view, (1, 0, 3, 2))
-    curv = np.full(sampled_p_t.shape[:2], np.nan)
-    radii = np.full(sampled_p_t.shape[:2], np.nan)
+    curv = np.full(points.shape[:2], np.nan)
+    radii = np.full(points.shape[:2], np.nan)
 
-    for i, (iterations, y) in enumerate(zip(n_iter, sampled_p_t)):
+    for i, (iterations, y) in enumerate(zip(n_iter, points)):
         if iterations < number_of_points:
             continue
         yw = np.lib.stride_tricks.sliding_window_view(
-            y[: iterations + 1], number_of_points, axis=0
+            y[exclude_initial : iterations + 1 - exclude_final],
+            number_of_points,
+            axis=0,
         )
         yw = yw.swapaxes(1, 2)
         x = np.linalg.norm(yw - yw[:, [0]], axis=2)
@@ -524,8 +498,9 @@ def compute_curvatures_and_radii(sampled_p, n_iter, number_of_points=3):
         p = StackedVectorPolynomial()
         p.fit(x, yw, deg=2)
         k = p.compute_curvature(x[:, c])
-        curv[i, insert_start_offset : iterations - (insert_end_offset)] = k
-        radii[i, insert_start_offset : iterations - (insert_end_offset)] = 1.0 / k
+        insert_slice = slice(insert_start_offset, iterations + 1 - insert_end_offset)
+        curv[i, insert_slice] = k
+        radii[i, insert_slice] = 1.0 / k
 
     return curv, radii
 
@@ -549,70 +524,70 @@ def normalize_01(arr):
     return (arr - amin) / (amax - amin)
 
 
-def solve_laplace():
-    bungert_dir = Path("/mnt/projects/INN/bungert_revisited")
-    m2m_dir = Path(bungert_dir / "subject_5" / "m2m_subject_5")
-    data_dir = Path("/mnt/projects/INN/jesper/nobackup/projects/white_matter_axons")
+def solve_laplace(cond_offset=0.2, cond_ratio=0.25):
+    data_dir = Path(
+        "/mnt/projects/INN/jesper/nobackup/projects/white_matter_axons/domain_M1"
+    )
+    surf_dir = data_dir / "surfaces_domain"
 
-    f_domain = data_dir / "mesh_complex.npz"
-    f_domain_field = data_dir / "domain_laplace.msh"
+    # f_domain = data_dir / "mesh_complex.npz"
 
-    deep_wm = cortech.Surface.from_file(data_dir / "domain-deep.vtk")
-    gm_sides = cortech.Surface.from_file(data_dir / "domain-gray-sides.vtk")
-    wm_sides = cortech.Surface.from_file(data_dir / "domain-white-sides.vtk")
-    wm = cortech.Surface.from_file(data_dir / "domain-white.vtk")
-    gm = cortech.Surface.from_file(data_dir / "domain-gray.vtk")
+    # Surfaces
+    # --------
+    deep_wm = cortech.Surface.from_file(surf_dir / "domain-deep.vtk")
+    gm_sides = cortech.Surface.from_file(surf_dir / "domain-gray-sides.vtk")
+    wm_sides = cortech.Surface.from_file(surf_dir / "domain-white-sides.vtk")
+    wm = cortech.Surface.from_file(surf_dir / "domain-white.vtk")
+    gm = cortech.Surface.from_file(surf_dir / "domain-gray.vtk")
 
     # Domain
-    # ---------------------------
-    domain_data = np.load(f_domain)
+    # ------
+    # domain_data = np.load(f_domain)
 
-    nodes = mesh_io.Nodes(domain_data["vertices"])
-    elements = mesh_io.Elements(tetrahedra=domain_data["cells"] + 1)
-    domain = mesh_io.Msh(nodes, elements)
-    domain.elm.tag1 = domain_data["cell_id"]
+    # nodes = mesh_io.Nodes(domain_data["vertices"])
+    # elements = mesh_io.Elements(tetrahedra=domain_data["cells"] + 1)
+    # domain = mesh_io.Msh(nodes, elements)
+    # domain.elm.tag1 = domain_data["cell_id"]
+    # label domain
+    # index = np.unique(domain_data["faces"])
 
-    index = np.unique(domain_data["faces"])
+    domain = mesh_io.read(data_dir / "domain_optimized.msh")
+    domain.nodedata = []
+    index = np.unique(domain.elm.node_number_list[domain.elm.triangles - 1, :3] - 1)
+    domain = domain.crop_mesh(elm_type=ElementTypes.TETRAHEDRON)
 
     surface_vertices = domain.nodes.node_coord[index]
 
+    # label domain
     cat_s = (wm, gm, deep_wm, wm_sides, gm_sides)
     cat_v = np.concat([s.vertices for s in cat_s])
     cat_id = np.concat([np.full(s.n_vertices, i) for i, s in enumerate(cat_s)])
     tree = scipy.spatial.KDTree(cat_v)
-    d, i = tree.query(surface_vertices)
+    _, i = tree.query(surface_vertices)
     label = cat_id[i]
-    domain.node_data.append(label)
+    tmp = np.zeros(domain.nodes.nr, int)
+    tmp[index] = label
+    domain.nodedata.append(mesh_io.NodeData(tmp, "label"))
 
-    boundary_indices = dict(
-        deep=index[label == 2],
-        gray=index[label == 1],
-        # white=index[label == 0],
-    )
-    boundary_values = dict(deep=0, white=500, gray=1000)
+    # Boundary condictions
+    boundary_indices = dict(deep=index[label == 2], gray=index[label == 1])
+    boundary_values = dict(deep=0, gray=1000)
 
-    # filename_domain = root_dir / "subject_5_ROI.msh"
-    # filename_domain_field = root_dir / f"subject_5_ROI_{suffix}.vtm"
-    # filename_lines = root_dir / f"subject_5_ROI_line_traces_{suffix}.vtm"
+    tmp = np.full(domain.nodes.nr, np.nan)
+    for k, v in boundary_indices.items():
+        tmp[v] = boundary_values[k]
+    domain.nodedata.append(mesh_io.NodeData(tmp, "boundary_conditions"))
 
-    # seed_points = pv.read(root_dir / "source_points.vtk").points
-
-    cond = generate_conductivity_map(domain, wm, 0.2, 0.25)
+    cond = generate_conductivity_map(domain, wm, cond_offset, cond_ratio)
     domain.elmdata.append(cond)
 
-    # Solve
-    mesh = prepare_field(domain, boundary_indices, boundary_values, cond)
-    mesh.save(f_domain_field)
-    mesh.to_multiblock().save(f_domain_field.with_suffix(".vtm"))
+    return prepare_field(domain, boundary_indices, boundary_values, cond)
 
 
-def trace_field_lines():
-    data_dir = Path("/mnt/projects/INN/jesper/nobackup/projects/white_matter_axons")
-
-    f_domain_field = data_dir / "domain_laplace.msh"
-    f_field_data = data_dir / "domain_field_data.npz"
-
-    domain = mesh_io.read(f_domain_field)
+def integrate_field_lines(domain, short_projections: float = 5.0):
+    data_dir = Path(
+        "/mnt/projects/INN/jesper/nobackup/projects/white_matter_axons/domain_M1/surfaces_domain"
+    )
 
     deep_wm = cortech.Surface.from_file(data_dir / "domain-deep.vtk")
     # wm = cortech.Surface.from_file(data_dir / "domain-white.vtk")
@@ -624,50 +599,96 @@ def trace_field_lines():
 
     prune, _ = gm.k_ring_neighbors(3, edge_vertices)
     prune = np.unique(np.concat(prune))
+    source_points_indices = np.setdiff1d(np.arange(gm.n_vertices), prune)
     sources = gm.remove_vertices(prune)
     source_normals = sources.compute_vertex_normals()
     # Move a little inwards
     seed_points = sources.vertices - 0.5 * source_normals
 
     # vector pointing from deep WM to skull
-    # primary_depth_dir = np.array([-0.51905445, -0.04680712, 0.85345859])
     depth_angle = np.degrees(np.acos(source_normals @ primary_depth_dir))
 
-    # seed_points = mesh.nodes.node_coord[boundary_indices["outer"]]
-    # seed_points = gm.points[select_on_surface_eroded]
-    # normals = gm.compute_normals(cell_normals=False, consistent_normals=False)[
-    #     "Normals"
-    # ][select_on_surface_eroded]
-    # seed_points_moved = seed_points - 0.5 * normals
-
-    # indices = np.random.choice(np.arange(len(seed_points)), 1000)
-    # seed_points = seed_points[indices]
-
     # target gradient in V
-    V_stepsize = 0.01 * np.abs(domain.field["V"].max() - domain.field["V"].min())
-    # V_stepsize = 0.01
-    # V_stepsize = 0.1
+    pot = domain.field["V"].value
+    V_stepsize = 0.01 * np.abs(pot.max() - pot.min())
 
     # , h_max=1.0, # for normalized vector fields
     points, potentials, thickness, n_iter, valid_seed_points = integrate_field(
         domain, seed_points, V_stepsize, verbose=True
     )
-    curv, radii = compute_curvatures_and_radii(points, n_iter)
+    curv, radius = compute_curvatures_and_radii(
+        points, n_iter, 3, exclude_initial=0, exclude_final=10
+    )
     # radii *= 1e3  # mm to um
 
     depth_angle = depth_angle[valid_seed_points]
 
-    np.savez(
-        f_field_data,
-        curv=curv,
+    invalid_projection = thickness < short_projections
+    valid_projection = ~invalid_projection
+
+    invalid_point = np.isnan(radius)
+    invalid_point[invalid_projection] = True
+    valid_point = ~invalid_point
+
+    r = np.ma.MaskedArray(radius, invalid_point)
+    c = np.ma.MaskedArray(curv, invalid_point)
+    min_bend_radius = r.min(1)
+    max_bend_curv = c.max(1)
+
+    # data per vertex
+    scalars_vertex = dict(
+        curv=curv, potentials=potentials, radius=radius, valid_point=valid_point
+    )
+
+    # data per projection/line
+    scalars_line = dict(
         depth_angle=depth_angle,
+        curv_max=max_bend_curv.filled(np.nan),
         n_iter=n_iter,
-        points=points,
-        potentials=potentials,
-        radii=radii,
+        original_index=source_points_indices[valid_seed_points],
+        radius_min=min_bend_radius.filled(np.nan),
         thickness=thickness,
+        valid_projection=valid_projection,
         valid_seed_points=valid_seed_points,
     )
+
+    return points, scalars_vertex, scalars_line
+
+
+if __name__ == "__main__":
+    offset = 0.2
+    cond_ratio = 0.2
+    settings_str = "-".join([str(i).replace(".", "") for i in (offset, cond_ratio)])
+
+    data_dir = Path(
+        "/mnt/projects/INN/jesper/nobackup/projects/white_matter_axons/domain_M1"
+    )
+    simu_dir = data_dir / f"simulation_{settings_str}"
+    if not simu_dir.exists():
+        simu_dir.mkdir()
+
+    f_field = simu_dir / "laplace_field.msh"
+    f_projections = simu_dir / "projections.h5"
+
+    print("Solving Laplace's equation on domain")
+    print("====================================")
+    domain = solve_laplace(offset, cond_ratio)
+
+    print("Integrating field lines")
+    print("=======================")
+    points, vertex_data, line_data = integrate_field_lines(domain)
+
+    io_utils.projections_as_hdf5(f_projections, points, vertex_data, line_data)
+    print(f"Wrote {f_projections}")
+
+    domain.save(str(f_field))
+    print(f"Wrote {f_field}")
+
+    domain.to_multiblock().save(f_field.with_suffix(".vtm"))
+    print(f"Wrote {f_field.with_suffix('.vtm')}")
+
+    # np.savez(f_field_data, points=points, **vertex_data, **line_data)
+    # print(f"Wrote {f_field_data}")
 
 
 """

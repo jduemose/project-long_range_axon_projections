@@ -1,9 +1,10 @@
 import numpy as np
 
+
 class StackedVectorPolynomial:
     def __init__(self, coef=None, deg: int | None = None):
-        """Class for fitting, evaluating, and differentiating multiple
-        polynomials.
+        """Class for vectorized fitting, evaluation, and differentiation of
+        multiple polynomials.
 
         Parameters
         ----------
@@ -123,8 +124,6 @@ class StackedVectorPolynomial:
     #     denom = np.linalg.norm(d1, axis=-1) ** 3
     #     # R = 1 / k
     #     return num / denom
-
-
 
 
 # valid_radii = radii[n_iter > min_number_of_points]

@@ -7,6 +7,12 @@ import scipy
 
 import io_utils
 
+import cortech
+import pyvista as pv
+
+plt.style.use("default")
+plt.style.use("science")
+
 
 def get_indices(how, value, points, vertex_data, line_data):
     n = len(points)
@@ -54,8 +60,6 @@ def indices_from_planes_crop(origins, normals, p):
         inside[inside] &= np.vecdot(normal, (p[inside] - origin)) < 0.0
     return inside
 
-
-p = points[:, 0]
 
 origin0 = np.array([-31.0, -2.5, 62.0])
 normal0 = np.array([0.7, -0.09, 0.70])
@@ -107,8 +111,8 @@ def make_alignment_bend_plot(depth_angle, curv):
     # ax.set_xlim(-1.0)
     ax.set_xlabel("Angular alignment (degrees)")
     ax.set_ylim(0.1)
-    ax.set_ylabel("Mean curvature (1/mm)")
-    ax.set_title(f"r = {result.rvalue}")
+    ax.set_ylabel("Curvature (1/mm)")
+    ax.set_title(f"r = {result.rvalue:.2f}")
     ax.grid(alpha=0.2)
     secaxy = ax.secondary_yaxis("right", functions=(curv2radius, curv2radius))
     secaxy.set_yticks(np.round(curv2radius(ax.get_yticks()[1:-1]), 2))
@@ -118,7 +122,7 @@ def make_alignment_bend_plot(depth_angle, curv):
 
 
 def make_alignment_on_surface(gm):
-    x = np.full(gm.n_points, np.nan)
+    x = np.full(wm.n_points, np.nan)
     valid_radii = ~min_bend_radii.mask
     x[select_on_surface[valid_seed_points][valid_radii]] = min_bend_radii.data[
         valid_radii
@@ -145,29 +149,10 @@ points, vertex_data, line_data = io_utils.projections_load_all(
 # fig, ax = make_alignment_bend_plot(
 #     depth_angle[~max_bend_curv.mask], max_bend_curv.data[~max_bend_curv.mask]
 # )
-valid = line_data["valid"]
+
+valid = line_data["valid_projection"]
 depth_angle = line_data["depth_angle"][valid]
 curv_max = line_data["curv_max"][valid]
-fig, ax = make_alignment_bend_plot(depth_angle, curv_max)
-ax.set_ylim(0.05, 2.0)
-ax.add_artist(rect)
-ax.plot(box_angle, [mean_curv_li, mean_curv_li], c="r")
-ax.plot(box_angle, [mean_curv_cottaar, mean_curv_cottaar], c="r")
-fig.suptitle(f"cond ratio = {cond_ratio}")
-
-
-# cottaar (2018) width parameter converted to bend radius
-#   width param     bend radius
-#   0.25             710 um
-#   0.50            1410 um
-#   0.75            2120 um
-
-# Li S et al. 2015. Single-Neuron Reconstruction of the Macaque Primary Motor
-# Cortex Reveals the Diversity of Neuronal Morphology.
-#   range 788.7 - 1560.8 [mean 1217.3±210.4] um
-
-# H01 dataset
-#   812.4555, 732.964 um
 
 mean_curv_li = 1 / 1.217
 mean_curv_cottaar = 1 / 1.410
@@ -184,12 +169,29 @@ rect = Rectangle(
     edgecolor="red",
 )
 
-fig.show()
+fig, ax = make_alignment_bend_plot(depth_angle, curv_max)
+ax.set_ylim(0.05, 2.0)
+ax.plot(box_angle, [mean_curv_li, mean_curv_li], c="r")
+ax.plot(box_angle, [mean_curv_cottaar, mean_curv_cottaar], c="r")
+ax.add_artist(rect)
+ax.set_title(f"conductivity ratio (gray/white) = {cond_ratio}")
+fig.savefig("curvature_vs_alignment.png", transparent=True)
 
-from pathlib import Path
-import cortech
-import numpy as np
-import pyvista as pv
+# cottaar (2018) width parameter converted to bend radius
+#   width param     bend radius
+#   0.25             710 um
+#   0.50            1410 um
+#   0.75            2120 um
+
+# Li S et al. 2015. Single-Neuron Reconstruction of the Macaque Primary Motor
+# Cortex Reveals the Diversity of Neuronal Morphology.
+#   range 788.7 - 1560.8 [mean 1217.3±210.4] um
+
+# H01 dataset
+#   812.4555, 732.964 um
+
+
+fig.show()
 
 
 results_dir = Path(
@@ -200,17 +202,36 @@ data_dir = Path(
 )
 surf_dir = data_dir / "surfaces_domain"
 
+domain = pv.read(data_dir / "simulation_02-02" / "laplace_field.vtm")
+
+
 wm = cortech.Surface.from_file(surf_dir / "domain-white.vtk")
-# edge_vertices = np.unique(wm.find_border_edges())
-# prune, _ = wm.k_ring_neighbors(3, edge_vertices)
-# prune = np.unique(np.concat(prune))
-# source_points_indices = np.setdiff1d(np.arange(wm.n_vertices), prune)
+
+edge_vertices = np.unique(wm.find_border_edges())
+prune, _ = wm.k_ring_neighbors(3, edge_vertices)
+prune = np.unique(np.concat(prune))
+wm = wm.remove_vertices(prune)
+
+
 white = pv.make_tri_mesh(wm.vertices, wm.faces)
 
 gm = cortech.Surface.from_file(surf_dir / "domain-gray.vtk")
+gray = pv.make_tri_mesh(gm.vertices, gm.faces)
 deep_wm = cortech.Surface.from_file(surf_dir / "domain-deep.vtk")
+deep_white = pv.make_tri_mesh(deep_wm.vertices, deep_wm.faces)
 
 depth = np.linalg.norm(gm.vertices - deep_wm.vertices, axis=1)
+
+
+points_flat = points.reshape(-1, 3)
+cells = np.arange(points_flat.shape[0]).reshape(points.shape[:2])
+cells = np.concatenate((np.full((cells.shape[0], 1), points.shape[1]), cells), 1)
+cells = cells.ravel()
+projections = pv.PolyData(points_flat, lines=cells)
+for k, v in vertex_data.items():
+    projections[k] = v.ravel()
+for k, v in line_data.items():
+    projections[k] = v
 
 
 mb = pv.MultiBlock([pv.read(i) for i in sorted(results_dir.glob("projection*.vtp"))])
@@ -334,331 +355,3 @@ plotter.camera.elevation = 50
 img_2 = plotter.screenshot(return_img=True, scale=4, transparent_background=True)
 screenshots.append(crop_img(img_1))
 screenshots.append(crop_img(img_2))
-
-
-import os
-import matplotlib
-from matplotlib import pyplot as plt
-import pyvista as pv
-import numpy as np
-from matplotlib.colors import LogNorm, Normalize, TwoSlopeNorm
-from matplotlib.colors import LinearSegmentedColormap
-from matplotlib import cm
-
-
-def crop_img(img):
-    bg = img[0, 0, :]
-
-    non_bg = (img[:, :, :3] != bg[:3]).any(axis=2) & (img[:, :, 3] > 0)
-
-    if not non_bg.any():
-        cropped = img
-    else:
-        ys, xs = np.where(non_bg)
-        y_min, y_max = ys.min(), ys.max()
-        x_min, x_max = xs.min(), xs.max()
-
-        pad = 50
-        y_min = max(y_min - pad, 0)
-        y_max = min(y_max + pad, img.shape[0] - 1)
-        x_min = max(x_min - pad, 0)
-        x_max = min(x_max + pad, img.shape[1] - 1)
-
-        cropped = img[y_min : y_max + 1, x_min : x_max + 1]
-
-    return cropped
-
-
-def create_cw_around_zero(data):
-    vmin, vmax = data.min(), data.max()
-    vcenter = 0
-    # Compute relative position of white in [0,1]
-    white_pos = (vcenter - vmin) / (vmax - vmin)
-    white_pos = np.clip(white_pos, 0, 1)  # make sure it's in [0,1]
-
-    # Create custom colormap
-    cdict = {
-        "red": [
-            (0.0, 0.0, 0.0),  # blue at 0
-            (white_pos, 1.0, 1.0),  # white at vcenter
-            (1.0, 1.0, 1.0),
-        ],  # red at max
-        "green": [(0.0, 0.0, 0.0), (white_pos, 1.0, 1.0), (1.0, 0.0, 0.0)],
-        "blue": [(0.0, 1.0, 1.0), (white_pos, 1.0, 1.0), (1.0, 0.0, 0.0)],
-    }
-
-    return LinearSegmentedColormap("BlueWhiteRed", cdict)
-
-
-waveform_type = "monophasic"
-subject = f"subject_5"
-diameter = 1.0
-
-base_path = f"/mrhome/torgehw/Documents/Projects/bungert_revisited/{subject}/Axons"
-base_result_path = os.path.join(
-    base_path, f"axon_bend_{parallel_surface}_{target_surface_distance}_{bend_radius}"
-)
-myelinated_axons_path = os.path.join(base_result_path, f"myelinated_axon_bends")
-
-parallel_surf: pv.PolyData = pv.read(
-    os.path.join(base_path, f"{parallel_surface}.vtk")
-).extract_surface()
-parallel_surf_E: pv.PolyData = pv.read(
-    os.path.join(base_path, f"{parallel_surface}_{target_surface_distance}_E_.vtk")
-)
-
-parallel_surf["E"] = parallel_surf_E["E"]
-
-parallel_surf_roi: pv.PolyData = parallel_surf.threshold(
-    1, scalars="ROI", all_scalars=True
-).extract_surface()
-
-
-wm = pv.read(
-    "/mnt/projects/INN/jesper/nobackup/projects/white_matter_axons/domain_M1/surfaces_roi/roi_surface_wm.vtk"
-)
-
-
-plotter = pv.Plotter(off_screen=True)
-
-threshold_value = np.percentile(parallel_surf_roi[scalars], 5)
-print(threshold_value)
-contours = parallel_surf_roi.contour(isosurfaces=[threshold_value], scalars=scalars)
-
-# First row: view from side 1
-plotter.add_mesh(
-    parallel_surf_roi,
-    copy_mesh=True,
-    scalars=scalars,
-    cmap=cmap,
-    clim=clim,
-    show_scalar_bar=False,
-    smooth_shading=True,
-)
-if enabled_percentile:
-    plotter.add_mesh(contours, color="black", line_width=10, render_lines_as_tubes=True)
-
-plotter.camera_position = "xz"
-plotter.camera.azimuth = -50
-plotter.camera.roll -= 20
-plotter.camera.elevation = 20
-plotter.background_color = "pink"
-img_1 = plotter.screenshot(return_img=True, scale=4, transparent_background=True)
-
-# Second row: view from opposite side
-plotter.camera_position = "xz"
-plotter.camera.azimuth = 140
-plotter.camera.roll += 15
-plotter.camera.elevation = 50
-img_2 = plotter.screenshot(return_img=True, scale=4, transparent_background=True)
-screenshots.append(crop_img(img_1))
-screenshots.append(crop_img(img_2))
-
-
-for inverted in [0, 1]:
-    direction = "P-A" if inverted else "A-P"
-
-    parallel_surf: pv.PolyData = pv.read(
-        os.path.join(
-            base_result_path,
-            f"axon_bend_{parallel_surface}_thresholds_{target_surface_distance}_{bend_radius}_{diam}_{waveform_type}_{direction}.vtk",
-        )
-    )
-    threshold_wm_surf_roi: pv.PolyData = parallel_surf.threshold(
-        1, scalars="ROI", all_scalars=True
-    ).extract_surface()
-    thresholds = np.zeros((threshold_wm_surf_roi.n_points, 18))
-    for i, angle in enumerate(range(0, 360, 20)):
-        thresholds[:, i] = threshold_wm_surf_roi[f"threshold_{angle}"]
-
-    threshold_min = thresholds.min(axis=1)
-    threshold_variance = np.std(thresholds, axis=1) / np.mean(thresholds, axis=1)
-
-    parallel_surf_roi.point_data[f"{direction}_Min"] = threshold_min
-    parallel_surf_roi.point_data[f"{direction}_Var"] = threshold_variance
-
-parallel_surf_roi.point_data[f"diff"] = np.log10(
-    parallel_surf_roi.point_data[f"A-P_Min"]
-    / (parallel_surf_roi.point_data[f"P-A_Min"])
-)
-diff_cm = create_cw_around_zero(parallel_surf_roi.point_data[f"diff"])
-
-# Define what to plot
-scalars_list = ["A-P_Min", "A-P_Var", "P-A_Min", "P-A_Var", "diff", "E"]
-
-clims = [
-    [90, 1000],
-    [0, 2.5],
-    [90, 1000],
-    [0, 2.5],
-    [
-        np.min(parallel_surf_roi.point_data[f"diff"]),
-        np.max(parallel_surf_roi.point_data[f"diff"]),
-    ],
-    [0, np.max(np.linalg.norm(parallel_surf_roi.point_data[f"E"], axis=1))],
-]
-print("A", np.max(np.linalg.norm(parallel_surf_roi.point_data[f"E"], axis=1)))
-
-base_cmap = matplotlib.colormaps["viridis_r"]
-my_colors = base_cmap(np.linspace(0, 1, 1024))
-my_colors[-1] = np.array([0.7, 0.7, 0.7, 1.0])
-my_cmap = LinearSegmentedColormap.from_list("my_viridis_r", my_colors)
-my_cmap.set_over(np.array([0.7, 0.7, 0.7, 1.0]))
-
-colormaps = [my_cmap, "plasma", my_cmap, "plasma", "bwr", "turbo"]
-enable_percentile = [True, False, True, False, False, False]
-
-screenshots = []
-for j, (scalars, clim, cmap, enabled_percentile) in enumerate(
-    zip(scalars_list, clims, colormaps, enable_percentile)
-):
-    plotter = pv.Plotter(off_screen=True)
-
-    threshold_value = np.percentile(parallel_surf_roi[scalars], 5)
-    print(threshold_value)
-    contours = parallel_surf_roi.contour(isosurfaces=[threshold_value], scalars=scalars)
-
-    # First row: view from side 1
-    plotter.add_mesh(
-        parallel_surf_roi,
-        copy_mesh=True,
-        scalars=scalars,
-        cmap=cmap,
-        clim=clim,
-        show_scalar_bar=False,
-        smooth_shading=True,
-    )
-    if enabled_percentile:
-        plotter.add_mesh(
-            contours, color="black", line_width=10, render_lines_as_tubes=True
-        )
-
-    plotter.camera_position = "xz"
-    plotter.camera.azimuth = -50
-    plotter.camera.roll -= 20
-    plotter.camera.elevation = 20
-    plotter.background_color = "pink"
-    img_1 = plotter.screenshot(return_img=True, scale=4, transparent_background=True)
-
-    # Second row: view from opposite side
-    plotter.camera_position = "xz"
-    plotter.camera.azimuth = 140
-    plotter.camera.roll += 15
-    plotter.camera.elevation = 50
-    img_2 = plotter.screenshot(return_img=True, scale=4, transparent_background=True)
-    screenshots.append(crop_img(img_1))
-    screenshots.append(crop_img(img_2))
-
-fig, axs = plt.subplots(
-    nrows=3,
-    ncols=4,
-    layout="constrained",
-    figsize=(6.5, 6.5 * np.sqrt(2) * 0.4),
-)
-# ----------------------------------------------------------------
-axs[0, 0].set_title("A-P")
-axs[0, 2].set_title("P-A")
-
-axs[0, 0].imshow(screenshots[0], interpolation="none")
-axs[0, 0].axis("off")
-
-axs[0, 1].imshow(screenshots[1], interpolation="none")
-axs[0, 1].axis("off")
-
-axs[0, 2].imshow(screenshots[4], interpolation="none")
-axs[0, 2].axis("off")
-
-axs[0, 3].imshow(screenshots[5], interpolation="none")
-axs[0, 3].axis("off")
-
-mappable = plt.cm.ScalarMappable(
-    norm=Normalize(vmin=clims[0][0], vmax=clims[0][1]), cmap=colormaps[0]
-)
-ticks = [clims[2][0], 250, 500, 750, clims[2][1]]
-
-cbar = fig.colorbar(
-    mappable,
-    ax=[axs[0, 0], axs[0, 1], axs[0, 2], axs[0, 3]],
-    extend="max",
-    ticks=ticks,
-    label="threshold \nin A/μs",
-    aspect=15,
-)
-
-cbar.ax.axhline(125, c="black")
-
-# ----------------------------------------------------------------
-
-axs[1, 0].imshow(screenshots[2], interpolation="none")
-axs[1, 0].axis("off")
-
-axs[1, 1].imshow(screenshots[3], interpolation="none")
-axs[1, 1].axis("off")
-
-axs[1, 2].imshow(screenshots[6], interpolation="none")
-axs[1, 2].axis("off")
-
-axs[1, 3].imshow(screenshots[7], interpolation="none")
-axs[1, 3].axis("off")
-
-mappable = plt.cm.ScalarMappable(
-    norm=Normalize(vmin=clims[1][0], vmax=clims[1][1]), cmap=colormaps[1]
-)
-ticks = [0, 0.5, 1, 1.5, 2, 2.5]
-
-cbar = fig.colorbar(
-    mappable,
-    ax=[axs[1, 0], axs[1, 1], axs[1, 2], axs[1, 3]],
-    ticks=ticks,
-    label="coefficient \nof variation",
-    aspect=15,
-)
-
-
-# ----------------------------------------------------------------
-axs[2, 0].imshow(screenshots[8], interpolation="none")
-axs[2, 0].axis("off")
-
-axs[2, 1].imshow(screenshots[9], interpolation="none")
-axs[2, 1].axis("off")
-
-mappable = plt.cm.ScalarMappable(
-    norm=LogNorm(vmin=10 ** clims[4][0], vmax=10 ** clims[4][1]), cmap=colormaps[4]
-)
-
-cbar = fig.colorbar(
-    mappable,
-    ax=axs[2, 1],
-    label=r"$\log_{10}\!\left(\dfrac{\text{A-P}}{\text{P-A}}\right)$",
-    aspect=15,
-)
-
-cbar.ax.set_yticks([0.25, 1, 4])
-cbar.ax.set_yticklabels([r"$\dfrac{1}{4}$", "1", "4"])
-
-# ----------------------------------------------------------------
-axs[2, 2].imshow(screenshots[10], interpolation="none")
-axs[2, 2].axis("off")
-
-axs[2, 3].imshow(screenshots[11], interpolation="none")
-axs[2, 3].axis("off")
-
-mappable = plt.cm.ScalarMappable(
-    norm=Normalize(vmin=clims[5][0], vmax=clims[5][1]), cmap=colormaps[5]
-)
-
-cbar = fig.colorbar(
-    mappable,
-    ax=[axs[2, 0], axs[2, 1], axs[2, 2], axs[2, 3]],
-    ticks=[0, 0.5, 1, 1.5, 2, 2.35],
-    label="|E| at 1 A/μs",
-    aspect=15,
-)
-
-# Save screenshot
-# plotter.show(screenshot="threshold_surface_summary.png")
-# plotter.screenshot(f"visualization/figures/axon_bend_{parallel_surface}_thresholds_{target_surface_distance}_{bend_radius}_{diam}_{waveform_type}_P-A_A-P_summary.png", scale=4)
-
-plt.savefig(
-    f"visualization/figures/axon_bend_{parallel_surface}_thresholds_{target_surface_distance}_{bend_radius}_{diam}_{waveform_type}_P-A_A-P_summary.svg"
-)
